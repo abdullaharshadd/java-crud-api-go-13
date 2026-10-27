@@ -53,7 +53,55 @@ func (h *Handler) Register(mux *http.ServeMux) {
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	h.Register(mux)
-	return Recoverer(StripTrailingSlash(mux))
+	return Recoverer(StripTrailingSlash(withNotFound(mux)))
+}
+
+// withNotFound replaces ServeMux's plain-text 404 for unmatched routes with
+// Spring Boot's default 404 JSON (NotFoundHandler). Method mismatches (405)
+// are left untouched.
+func withNotFound(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern != "" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(&notFoundWriter{ResponseWriter: w, r: r}, r)
+	})
+}
+
+// notFoundWriter intercepts a 404 written by ServeMux's default handler and
+// writes the Spring-style JSON body instead.
+type notFoundWriter struct {
+	http.ResponseWriter
+	r         *http.Request
+	intercept bool
+	wrote     bool
+}
+
+func (n *notFoundWriter) WriteHeader(code int) {
+	if n.wrote {
+		return
+	}
+	n.wrote = true
+	if code == http.StatusNotFound {
+		n.intercept = true
+		h := n.ResponseWriter.Header()
+		h.Del("Content-Type")
+		h.Del("X-Content-Type-Options")
+		NotFoundHandler().ServeHTTP(n.ResponseWriter, n.r)
+		return
+	}
+	n.ResponseWriter.WriteHeader(code)
+}
+
+func (n *notFoundWriter) Write(b []byte) (int, error) {
+	if !n.wrote {
+		n.WriteHeader(http.StatusOK)
+	}
+	if n.intercept {
+		return len(b), nil
+	}
+	return n.ResponseWriter.Write(b)
 }
 
 // StripTrailingSlash removes a single trailing slash from the request path
