@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -40,6 +42,21 @@ func buildRouter() http.Handler {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to open database")
+	}
+
+	var schemaErr error
+	for attempt := 0; attempt < 30; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		schemaErr = repository.EnsureSchema(ctx, db)
+		cancel()
+		if schemaErr == nil {
+			break
+		}
+		log.Warn().Err(schemaErr).Msg("schema setup failed, retrying")
+		time.Sleep(2 * time.Second)
+	}
+	if schemaErr != nil {
+		log.Fatal().Err(schemaErr).Msg("failed to create database schema")
 	}
 
 	repo := repository.NewMySQLUserRepository(db)
