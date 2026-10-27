@@ -234,7 +234,7 @@ func TestHashJavaParity(t *testing.T) {
 		{"hello", 99162322},
 		{"Aa", 2112},
 		{"BB", 2112},
-		{"😀", 1772897}, // surrogate pair 0xD83D,0xDE00
+		{"😀", 1772899}, // surrogate pair 0xD83D,0xDE00
 	}
 	for _, tc := range tests {
 		t.Run(tc.s, func(t *testing.T) {
