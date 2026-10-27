@@ -1,80 +1,155 @@
 # java-crud-api (Go)
 
-A REST CRUD API for managing users, backed by MySQL. This is a Go port of the Spring Boot project `abdullaharshadd/java-crud-api`. All 8 modules of the original were migrated to the Go standard library stack.
+A REST API for creating, reading, updating and deleting user records in MySQL. This is the Go port of the Spring Boot project `abdullaharshadd/java-crud-api`. All 8 modules were migrated.
 
-**Verification status for this migration:**
+Each user has these fields:
+
+- name
+- email (unique)
+- password
+- role
+- about (up to 500 characters)
+
+## Verification status
+
+These checks were run against the migrated code:
 
 | Check | Result |
 |---|---|
-| Build | passed |
-| Target unit tests | passed |
-| Behavior compared with the original | passed |
+| Build (`go build ./cmd/server`) | passed |
+| Unit tests (`go test ./...`) | passed |
+| Behaviour compared with the original Spring app | passed |
 
-The migration tool rated its own confidence at 95%. That figure is a self-assessment, not a measured result. Several components still need manual review. See [Manual review required](#manual-review-required).
+The migration tool also reported a self-assessed confidence of 95%. That figure is the model's own estimate, not a measured result. Some modules are still flagged for review (see [Manual review required](#manual-review-required)).
 
 ## Tech stack
 
-- **Language:** Go (standard library HTTP server)
-- **Database:** MySQL
-- **Packaging:** Go modules (`go.mod`), Docker (`Dockerfile`, `docker-compose.yml`)
+- **Go**, with the module `migrated-app`. `go.mod` declares `go 1.23`. Verification ran on the Go toolchain from `golang:1.27-alpine`.
+- **HTTP router:** [chi](https://github.com/go-chi/chi) v5.1.0, with the `Logger` and `Recoverer` middleware.
+- **Database driver:** [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) v1.8.1, used through the standard library's `database/sql`.
+- **Configuration:** [viper](https://github.com/spf13/viper) v1.19.0, reading environment variables.
+- **Logging:** [zerolog](https://github.com/rs/zerolog) v1.33.0.
+- **Database:** MySQL. The original Spring app also used MySQL. `docker-compose.yml` uses the `mysql:8` image.
 
 ## Prerequisites
 
-- **Go 1.27.** The migration was built and tested with the `golang:1.27-alpine` image.
-- **git.** `go mod tidy` uses it to fetch modules.
-- **A C build toolchain** (gcc, make, libc headers). The build environment installed Alpine's `build-base` package. On other systems, install the equivalent, such as `build-essential` on Debian/Ubuntu or Xcode Command Line Tools on macOS.
-- **A reachable MySQL server**, with a database the app can connect to.
-- **Docker with Docker Compose** (optional). Needed only for the compose-based setup.
+- **Go toolchain.** Verification used the toolchain shipped in `golang:1.27-alpine`. `go.mod` requires at least Go 1.23.
+- **git and a C build toolchain.** On Alpine, install them with:
+  ```sh
+  apk add --no-cache git build-base
+  ```
+- **A reachable MySQL 8 server** with a database and a user that can create tables in it.
+- **Optional:** Docker with the Compose plugin, if you want to use the Docker Compose path.
 
 ## Getting started
 
-Run all commands from the root of a fresh clone.
+Run these steps from the root of a fresh clone.
 
-### 1. Install dependencies and build
+### 1. Resolve dependencies
+
+Module checksums are not committed, so you must resolve modules first:
+
+```sh
+go mod tidy
+```
+
+### 2. Build
 
 ```sh
 mkdir -p bin
-go mod tidy
 go build -o bin/server ./cmd/server
 ```
 
-This produces the server binary at `bin/server`.
+### 3. Prepare the database
 
-### 2. Set environment variables
+You do not need to run a separate schema step. At startup the server runs idempotent `CREATE TABLE IF NOT EXISTS` statements (see `internal/repository/schema.go`) that create:
+
+- the `user` table, with a unique key on `user_email`
+- the `hibernate_sequence` table, used for ID generation, seeded with `next_val = 1` when empty
+
+You only need to provide:
+
+- an existing MySQL database
+- a user with `CREATE`, `INSERT`, `SELECT`, `UPDATE` and `DELETE` privileges on that database
+
+The startup check is retried up to 30 times, 2 seconds apart, so the server can wait for a database that is still starting. If every attempt fails, the process exits.
+
+### 4. Configure the environment
+
+The connection string is passed directly to `go-sql-driver/mysql`. Use that driver's DSN format, `user:password@tcp(host:port)/dbname?parseTime=true`. Adjust the values below to match your MySQL instance:
 
 ```sh
-export DATABASE_URL='<your MySQL connection string>'
+export DATABASE_URL='app:app@tcp(localhost:3306)/app?parseTime=true'
 export PORT=8080
-export JWT_SECRET='<a long random secret>'
+export JWT_SECRET=change-me
 ```
 
-See [Environment variables](#environment-variables) for details.
+If you set nothing, the server listens on port **8082** and connects with `root:root@tcp(localhost:3306)/barcode?parseTime=true`. These defaults match the original Spring configuration.
 
-### 3. Database setup
-
-This run recorded no explicit database setup command. Before starting the server, make sure the MySQL database referenced by `DATABASE_URL` exists and the configured user can access it.
-
-The original Spring app relied on Hibernate `ddl-auto` to create the `User` table. The Go port includes `internal/repository/schema.go` for schema definition. Confirm that the schema it defines is created at startup before relying on it in a real environment (see [Known limitations](#known-limitations)).
-
-### 4. Run the server
+### 5. Run
 
 ```sh
 ./bin/server
 ```
 
-The server listens on port **8080**: `http://localhost:8080`.
+The server logs `server started on :8080` and listens on `http://localhost:8080`. It shuts down gracefully on `SIGINT` or `SIGTERM`, with a 10 second timeout.
 
-**A first request to try:** this migration run recorded no individually verified example requests. To find the available endpoints, read the route registrations in `cmd/server/router.go`.
+### A first request to try
+
+These requests were verified against the migrated server:
+
+```sh
+curl -i http://localhost:8080/get_user_data
+```
+
+Expected response: `200`.
+
+Other verified requests:
+
+| Request | Status |
+|---|---|
+| `GET /get_user_data` | 200 |
+| `GET /get_user_data/1` | 200 |
+| `GET /get_user_name/name/Priya%20Sharma` | 200 |
+| `GET /delete_user_data/1` | 405 (wrong method) |
+| `POST /save_user_data` with a JSON body containing `name`, `email`, `password`, `role` and `about` | 200 |
+| `PUT /update_user_data/1` with the body below | 200 |
+| `DELETE /delete_user_data/1` | 200 |
+
+```sh
+curl -i -X POST http://localhost:8080/save_user_data \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Priya Sharma", "email": "priya.sharma@example.com", "password": "Secure@Pass2024", "role": "ROLE_USER", "about": "Software engineer based in Bangalore."}'
+
+curl -i -X PUT http://localhost:8080/update_user_data/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Jane Smith", "email": "jane.smith@example.com", "password": "SecurePass123", "role": "ROLE_USER", "about": "Software engineer who enjoys hiking and photography."}'
+
+curl -i -X DELETE http://localhost:8080/delete_user_data/1
+```
+
+The ID-based requests assume that a user with ID `1` already exists. Create one first with `POST /save_user_data`, as shown above.
+
+The server also exposes a liveness endpoint, `GET /healthz`, which returns `200` with the body `ok`.
 
 ### Alternative: Docker Compose
 
-The repository includes a `Dockerfile` and a `docker-compose.yml`:
+The `DATABASE_URL` committed in `docker-compose.yml` (`mysql://app:app@mysql:3306/app`) is in URL form, which `go-sql-driver/mysql` cannot parse as a DSN, so the app cannot connect and exits after its 30 schema retries. Before starting the stack, change that line in `docker-compose.yml` to the driver's DSN form:
+
+```yaml
+      DATABASE_URL: "app:app@tcp(mysql:3306)/app?parseTime=true"
+```
+
+Then run:
 
 ```sh
 docker compose up --build
 ```
 
-Before relying on this setup, review `docker-compose.yml` for the services, ports and environment values it defines. This migration run did not exercise the compose setup.
+This starts two containers:
+
+- `mysql`: MySQL 8 with database `app`, user `app` and password `app`. A named volume, `mysql-data`, persists the data. Port 3306 is exposed only on the Compose network, not on the host.
+- `app`: the API. It waits until the MySQL healthcheck passes, then serves on `http://localhost:8080`.
 
 ## Running tests
 
@@ -82,78 +157,124 @@ Before relying on this setup, review `docker-compose.yml` for the services, port
 go test ./...
 ```
 
-The target unit tests passed during migration.
-
 ## Environment variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `DATABASE_URL` | yes | Connection string for the MySQL database. The exact format the app expects is parsed in `internal/config/config.go` and was not recorded in this run. |
-| `PORT` | yes | Port for the HTTP server to listen on. The migration ran with `8080`. |
-| `JWT_SECRET` | yes | Secret used for signing and verifying JWTs. Use a long random value and never commit it. |
+| Variable | Used | Default | Description |
+|---|---|---|---|
+| `PORT` | yes | `8082` | HTTP listen port. |
+| `SERVER_PORT` | yes | — | Overrides `PORT` when set. This is the original Spring property name. |
+| `DATABASE_URL` | yes | `root:root@tcp(localhost:3306)/barcode?parseTime=true` | MySQL DSN in `go-sql-driver/mysql` format. |
+| `DB_DSN` | yes | — | Overrides `DATABASE_URL` when set. |
+| `JWT_SECRET` | read, **not used** | — | Loaded into the config, but no code uses it. |
+
+`docker-compose.yml` also sets `DB_HOST`, `DB_NAME`, `DB_PASSWORD`, `DB_PORT`, `DB_USER`, `DB_USERNAME` and `MYSQL_URL`. The application does not read any of these.
 
 ## Architecture overview
 
 ```
-cmd/server/
-  main.go              Entry point: loads config, wires dependencies, starts the HTTP server
-  router.go            HTTP route registration
-internal/config/
-  config.go            Reads configuration from environment variables
-internal/httpapi/
-  handler.go           HTTP handlers for the user CRUD endpoints (replaces the Spring controller)
-  errors.go            Maps service errors to HTTP error responses (replaces RestResponseEntityExceptionHandling)
-internal/model/
-  user.go              User struct (replaces the JPA/Lombok User entity)
-  error_message.go     JSON error response body
-internal/repository/
-  schema.go            Database schema for the user table (replaces Hibernate ddl-auto)
-  user_repository.go   Explicit SQL data access for users (replaces the Spring Data UserDao)
-internal/service/
-  user_service.go      Business logic for users (replaces UserServiceImp)
-  errors.go            Service-level error values, e.g. user not found (replaces UserNotFoundException)
+cmd/server/main.go                  Entry point: loads config, starts http.Server, graceful shutdown
+cmd/server/router.go                chi router, middleware, /healthz, DB connection,
+                                    schema bootstrap with retries, dependency wiring
+internal/config/config.go           Env-based configuration (viper) and defaults
+internal/httpapi/handler.go         HTTP handlers and User routes
+internal/httpapi/errors.go          Maps errors to HTTP error responses
+internal/model/user.go              User struct
+internal/model/error_message.go     Error response body
+internal/repository/schema.go       Idempotent CREATE TABLE statements
+internal/repository/user_repository.go   MySQL repository with explicit SQL
+internal/service/user_service.go    Business logic between handlers and repository
+internal/service/errors.go          Service-level errors (e.g. user not found)
+Dockerfile, docker-compose.yml      Container build and local stack
 ```
 
-A request flows through these layers: `router.go` → `httpapi` handler → `service` → `repository` → MySQL. Errors returned from the service layer are translated into HTTP responses in `internal/httpapi/errors.go`.
+A request passes through these layers in order:
+
+1. chi middleware (Logger, Recoverer)
+2. `httpapi.Handler`
+3. `service.UserService`
+4. `repository.NewMySQLUserRepository`
+5. MySQL, through `database/sql`
+
+The router mounts these routes:
+
+| Method | Path |
+|---|---|
+| `POST` | `/save_user_data` |
+| `GET` | `/get_user_data` |
+| `GET` | `/get_user_data/{id}` |
+| `PUT` | `/update_user_data/{id}` |
+| `DELETE` | `/delete_user_data/{id}` |
+| `GET` | `/get_user_name/name/{name}` |
+| `GET` | `/healthz` |
 
 ## Migration notes
 
-No individual behavioral changes from the original were recorded for this migration. The structural changes below follow from moving off the Spring/JPA runtime:
+Changes from the original Spring codebase:
 
-- **Spring dependency injection → explicit wiring.** Components are constructed and connected by hand in `cmd/server/main.go`, because Go has no DI container.
-- **Spring Data `UserDao` → hand-written repository.** Spring Data generates repository implementations at runtime from interface method names, and Go has no equivalent. `internal/repository/user_repository.go` therefore uses explicit SQL.
-- **Hibernate schema auto-generation → explicit schema.** Hibernate's annotation-driven DDL has no 1:1 Go equivalent. The schema is defined in `internal/repository/schema.go` instead.
-- **Lombok → plain Go struct.** Lombok is Java compile-time code generation. `internal/model/user.go` defines the fields directly.
-- **`@ControllerAdvice` exception handling → error mapping.** Java exceptions became Go error values in `internal/service/errors.go`. They are translated to HTTP responses in `internal/httpapi/errors.go`.
+- **JSON decoding differences.**
+  - Changes:
+    - Request keys now match case-insensitively. Jackson is case-sensitive.
+    - A quoted number such as `"3"` is no longer coerced into an int field. It is rejected with a `400`.
+  - Reason: the migration plan accepts these as known differences that do not affect well-formed clients.
+- **405 response body.**
+  - Change: a wrong HTTP method still returns `405` with an `Allow` header. The body is now a short text line from Go's ServeMux. Spring sent an empty body.
+  - Reason: the plan considers this small body difference acceptable.
+- **Hibernate dialect setting removed.**
+  - Reason: it has no equivalent in Go's `database/sql`.
+- **`ddl-auto=update` replaced by `CREATE TABLE IF NOT EXISTS` at startup.**
+  - Change: columns are no longer added automatically to an existing table.
+  - Reason: the model is fixed, so adding columns is not needed. `IF NOT EXISTS` also keeps an existing Hibernate-created database safe.
+- **Thymeleaf and devtools removed.**
+  - Reason: Thymeleaf was unused (there are no templates), and devtools is only for development.
+- **New `GET /healthz` endpoint.**
+  - Change: it returns `200` with the body `ok`.
+  - Reason (inferred): lets container orchestration check that the process is alive.
+- **Additional configuration variables.**
+  - Change: `PORT` and `DATABASE_URL` are now read in addition to `SERVER_PORT` and `DB_DSN`. `JWT_SECRET` is read but not used.
+  - Reason (inferred): matches the generic container environment set in `docker-compose.yml`.
+- **Dockerfile and docker-compose.yml added.**
+  - Change: these run the service on port 8080 against a bundled MySQL 8 container with database `app` and credentials `app`/`app`. The original ran on port 8082 against database `barcode` with `root`/`root`.
+  - Reason (inferred): containerised local deployment.
+- **Schema creation retried at startup.**
+  - Change: up to 30 attempts, 2 seconds apart, before the process exits. The plan had it exit on the first failure.
+  - Reason (inferred): tolerates a database container that is still starting.
 
 ## Known limitations
 
-These components of the original could not be translated directly:
+These parts of the original could not be translated one-to-one:
 
-- **`UserNotFoundException(String, Throwable, boolean, boolean)` protected constructor.** This constructor controls suppressed-exception tracking and stack-trace writability, which are JVM `Throwable` features. It was dropped. "User not found" is represented as a lightweight Go error value instead.
-- **Hibernate `ddl-auto` schema generation for `User`.** The original derived the table, the unique constraint on `User_Email`, the length of 500 for `User_About`, and primary key generation from annotations plus a properties flag. The Go schema must reproduce these explicitly and must be created at startup or by migrations.
-- **Lombok annotations on `User`.** Java-specific code generation. The Go struct must not expose the password in serialized output or logs.
-- **Spring Data JPA runtime proxy for `UserDao`.** Only the CRUD methods actually used by callers, plus `FindByName`, should exist in the Go repository. Any other inherited `JpaRepository` behavior is not available.
-- **JPA persistence context / dirty checking.** Hibernate automatically flushed changes to managed entities at transaction commit. Go has no such mechanism. If the original service mutated a loaded `User` inside a `@Transactional` method without calling `save()`, the Go code must issue an explicit update.
+- **`UserNotFoundException(String, Throwable, boolean, boolean)` protected constructor.**
+  - Why: it controls suppressed-exception tracking and stack-trace writability. These are JVM `Throwable` features with no Go equivalent.
+  - Current state: the constructor is dropped. Errors are plain Go error values (`internal/service/errors.go`).
+- **Hibernate schema auto-generation for the `User` entity.**
+  - Why: implicit DDL generated from annotations has no direct equivalent in Go.
+  - Current state: the schema is hand-written in `internal/repository/schema.go`. It keeps the table and column names, the unique email constraint, the 500-character length for `about`, and the `hibernate_sequence` ID table.
+  - Consequence: future model changes need manual DDL.
+- **Lombok annotations on `User`.**
+  - Why: Lombok is Java-only compile-time code generation.
+  - Current state: replaced by a plain Go struct in `internal/model/user.go`.
+- **`UserDao` (Spring Data `JpaRepository` proxy).**
+  - Why: Spring generates the implementation at runtime. Go has no equivalent.
+  - Current state: replaced by explicit SQL in `internal/repository/user_repository.go`. Only the operations the service uses are implemented, plus find-by-name.
+- **JPA persistence context and dirty checking.**
+  - Why: Hibernate automatically flushed changes to managed entities. Go has no implicit flush.
+  - Consequence: any update must be an explicit repository call.
+- **`JWT_SECRET` is configuration only.**
+  - Current state: the value is loaded, but no authentication is implemented.
 
 ## Manual review required
 
-The migration flagged these as low-confidence. Verify them by hand:
-
-1. **`User` model** (`internal/model/user.go`, `internal/repository/schema.go`)
-   - Table and column names match the original schema.
-   - `User_Email` has a unique constraint.
-   - `User_About` has length 500.
-   - Primary key generation matches the original.
-   - The password is excluded from JSON responses and string output.
-   - The schema is actually created at startup, or a migration step is documented.
-2. **Exception handling** (`internal/httpapi/errors.go`, `internal/model/error_message.go`)
-   - HTTP status codes and error response bodies match the original for each error case, including user-not-found and validation errors.
-3. **User service** (`internal/service/user_service.go`)
-   - Every update path persists changes with an explicit repository call. Check especially for any original logic that relied on JPA dirty checking.
-   - Transactional boundaries are preserved where the original used `@Transactional`.
-4. **Repository** (`internal/repository/user_repository.go`)
-   - `FindByName` and the CRUD methods used by the service behave like their Spring Data counterparts, including the "not found" result.
-5. **Configuration** (`internal/config/config.go`)
-   - Document the expected `DATABASE_URL` format.
-   - Confirm how `JWT_SECRET` is used and whether missing values fail fast at startup.
+- **Code ported from the original `User` entity (low confidence)**, in `internal/model/user.go` and `internal/repository/schema.go`. Verify:
+  - column names and types
+  - the unique email constraint
+  - the `about` length
+  - that ID generation through `hibernate_sequence` matches the original
+  - that the password is not exposed unintentionally in JSON responses or logs
+- **Code ported from `RestResponseEntityExceptionHandling` (low confidence)**, in `internal/httpapi/errors.go` and `internal/model/error_message.go`. Verify that the status codes and error body shape match the original for not-found and validation errors.
+- **Code ported from `UserServiceImp` (low confidence)**, in `internal/service/user_service.go`. Verify:
+  - that the update path writes every field explicitly
+  - that the original did not rely on JPA dirty checking anywhere a Go equivalent might be missing
+- **The `DATABASE_URL` format in `docker-compose.yml`.**
+  - Problem: it uses `mysql://app:app@mysql:3306/app`. The app passes this value unchanged to `go-sql-driver/mysql`, which expects `user:pass@tcp(host:port)/db` and does not convert URL-style strings, so the Compose stack as committed cannot connect.
+  - What to do: change it in `docker-compose.yml` to `app:app@tcp(mysql:3306)/app?parseTime=true` (as described in [Alternative: Docker Compose](#alternative-docker-compose)), or set `DB_DSN` to that value.
+- **Unused variables in `docker-compose.yml`.** `DB_HOST`, `DB_NAME`, `DB_PASSWORD`, `DB_PORT`, `DB_USER`, `DB_USERNAME` and `MYSQL_URL` are never read. Remove them, or wire them into the configuration on purpose.
