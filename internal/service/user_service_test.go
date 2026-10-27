@@ -373,7 +373,10 @@ func TestUpdateUser(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := NewUserService(tt.repo).UpdateUser(context.Background(), tt.id, tt.user)
+			err := NewUserService(tt.repo).UpdateUser(context.Background(), int32(tt.id), tt.user)
+			// UpdateUser mutates the input in place (Java: user.setId(id)); the
+			// "returned" user is the same instance.
+			got := tt.user
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error")
@@ -422,7 +425,8 @@ func TestGetUserNameByName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := &fakeRepo{findByNameFn: tt.fn}
-			got, found, err := NewUserService(repo).GetUserNameByName(context.Background(), tt.query)
+			got, err := NewUserService(repo).GetUserNameByName(context.Background(), tt.query)
+			found := got != nil
 			if repo.lastName != tt.query || repo.findByNameCalls != 1 {
 				t.Fatalf("FindByName not called correctly")
 			}
