@@ -10,235 +10,267 @@ import (
 )
 
 type fakeRepo struct {
-	users  map[int32]*model.User
-	nextID int32
-	err    error
-	nilAll bool
-	saves  []*model.User
+	insertFn     func(ctx context.Context, u *model.User) error
+	updateFn     func(ctx context.Context, u *model.User) error
+	findAllFn    func(ctx context.Context) ([]*model.User, error)
+	findByIDFn   func(ctx context.Context, id int32) (*model.User, bool, error)
+	findByNameFn func(ctx context.Context, name string) (*model.User, bool, error)
+	deleteFn     func(ctx context.Context, id int32) error
+
+	insertCalls, updateCalls, findAllCalls, findByIDCalls, findByNameCalls, deleteCalls int
+	lastFindID, lastDeleteID                                                             int32
+	lastName                                                                             string
+	updatedIDs                                                                           []int32
 }
 
-func newFakeRepo() *fakeRepo { return &fakeRepo{users: map[int32]*model.User{}, nextID: 1} }
-
-func cp(u *model.User) *model.User { c := *u; return &c }
+var _ repository.UserRepository = (*fakeRepo)(nil)
 
 func (f *fakeRepo) Insert(ctx context.Context, u *model.User) error {
-	if f.err != nil {
-		return f.err
+	f.insertCalls++
+	if f.insertFn != nil {
+		return f.insertFn(ctx, u)
 	}
-	u.ID = f.nextID
-	f.nextID++
-	f.users[u.ID] = cp(u)
+	u.SetID(100)
 	return nil
 }
+
 func (f *fakeRepo) Update(ctx context.Context, u *model.User) error {
-	if f.err != nil {
-		return f.err
+	f.updateCalls++
+	f.updatedIDs = append(f.updatedIDs, u.GetID())
+	if f.updateFn != nil {
+		return f.updateFn(ctx, u)
 	}
-	if _, ok := f.users[u.ID]; !ok {
-		return repository.ErrUserNotExist
-	}
-	f.users[u.ID] = cp(u)
 	return nil
 }
+
 func (f *fakeRepo) Save(ctx context.Context, u *model.User) (*model.User, error) {
-	f.saves = append(f.saves, cp(u))
-	if f.err != nil {
-		return nil, f.err
-	}
-	s := cp(u)
-	if _, ok := f.users[s.ID]; s.ID != 0 && ok {
-		f.users[s.ID] = cp(s)
-		return s, nil
-	}
-	s.ID = f.nextID
-	f.nextID++
-	f.users[s.ID] = cp(s)
-	return s, nil
+	return nil, errors.New("Save should not be called by the service")
 }
+
 func (f *fakeRepo) FindAll(ctx context.Context) ([]*model.User, error) {
-	if f.err != nil {
-		return nil, f.err
+	f.findAllCalls++
+	if f.findAllFn != nil {
+		return f.findAllFn(ctx)
 	}
-	if f.nilAll {
-		return nil, nil
-	}
-	out := make([]*model.User, 0)
-	for i := int32(0); i < f.nextID; i++ {
-		if u, ok := f.users[i]; ok {
-			out = append(out, cp(u))
-		}
-	}
-	return out, nil
+	return nil, nil
 }
+
 func (f *fakeRepo) FindByID(ctx context.Context, id int32) (*model.User, bool, error) {
-	if f.err != nil {
-		return nil, false, f.err
+	f.findByIDCalls++
+	f.lastFindID = id
+	if f.findByIDFn != nil {
+		return f.findByIDFn(ctx, id)
 	}
-	u, ok := f.users[id]
-	if !ok {
-		return nil, false, nil
-	}
-	return cp(u), true, nil
+	return nil, false, nil
 }
+
 func (f *fakeRepo) FindByName(ctx context.Context, name string) (*model.User, bool, error) {
-	if f.err != nil {
-		return nil, false, f.err
+	f.findByNameCalls++
+	f.lastName = name
+	if f.findByNameFn != nil {
+		return f.findByNameFn(ctx, name)
 	}
-	var found *model.User
-	for _, u := range f.users {
-		if u.Name != nil && *u.Name == name {
-			if found != nil {
-				return nil, false, repository.ErrNonUniqueResult
-			}
-			found = cp(u)
-		}
-	}
-	return found, found != nil, nil
+	return nil, false, nil
 }
+
 func (f *fakeRepo) DeleteByID(ctx context.Context, id int32) error {
-	if f.err != nil {
-		return f.err
+	f.deleteCalls++
+	f.lastDeleteID = id
+	if f.deleteFn != nil {
+		return f.deleteFn(ctx, id)
 	}
-	if _, ok := f.users[id]; !ok {
-		return repository.ErrUserNotExist
-	}
-	delete(f.users, id)
 	return nil
 }
-func (f *fakeRepo) Count(ctx context.Context) (int64, error) { return int64(len(f.users)), f.err }
-func (f *fakeRepo) ExistsByID(ctx context.Context, id int32) (bool, error) {
-	_, ok := f.users[id]
-	return ok, f.err
-}
 
-var errDB = errors.New("db failure")
+func (f *fakeRepo) Count(ctx context.Context) (int64, error)            { return 0, nil }
+func (f *fakeRepo) ExistsByID(ctx context.Context, id int32) (bool, error) { return false, nil }
 
-func user(id int32, name string) *model.User {
-	return model.NewUserBuilder().ID(id).Name(name).Email(name + "@x.com").Build()
-}
+func sp(s string) *string { return &s }
 
 func TestSaveUser(t *testing.T) {
+	dbErr := errors.New("duplicate email")
 	tests := []struct {
-		name    string
-		setup   func(*fakeRepo)
-		in      *model.User
-		wantID  int32
-		wantErr error
-		anyErr  bool
+		name        string
+		user        *model.User
+		repo        *fakeRepo
+		wantErr     bool
+		wantErrIs   error
+		wantID      int32
+		wantInserts int
+		wantUpdates int
 	}{
-		{name: "new user gets id", in: user(0, "alice"), wantID: 1},
-		{name: "existing id overwritten", setup: func(f *fakeRepo) { f.users[1] = user(1, "old"); f.nextID = 2 }, in: user(1, "new"), wantID: 1},
-		{name: "repo error propagates", setup: func(f *fakeRepo) { f.err = errDB }, in: user(0, "x"), wantErr: errDB},
-		{name: "nil user", in: nil, anyErr: true},
+		{
+			name:        "new user gets generated id",
+			user:        model.NewUserBuilder().Name("a").Email("a@x").Build(),
+			repo:        &fakeRepo{},
+			wantID:      100,
+			wantInserts: 1,
+		},
+		{
+			name:        "existing id is updated",
+			user:        model.NewUserBuilder().ID(5).Name("b").Build(),
+			repo:        &fakeRepo{},
+			wantID:      5,
+			wantUpdates: 1,
+		},
+		{
+			name: "nonexistent id inserts with new id",
+			user: model.NewUserBuilder().ID(77).Name("c").Build(),
+			repo: &fakeRepo{updateFn: func(context.Context, *model.User) error {
+				return repository.ErrUserNotExist
+			}},
+			wantID:      100,
+			wantUpdates: 1,
+			wantInserts: 1,
+		},
+		{
+			name: "update db error propagates",
+			user: model.NewUserBuilder().ID(5).Build(),
+			repo: &fakeRepo{updateFn: func(context.Context, *model.User) error { return dbErr }},
+			wantErr: true, wantErrIs: dbErr, wantUpdates: 1,
+		},
+		{
+			name: "insert db error propagates",
+			user: model.NewUserBuilder().Name("d").Build(),
+			repo: &fakeRepo{insertFn: func(context.Context, *model.User) error { return dbErr }},
+			wantErr: true, wantErrIs: dbErr, wantInserts: 1,
+		},
+		{
+			name:    "nil user errors",
+			user:    nil,
+			repo:    &fakeRepo{},
+			wantErr: true,
+		},
+		{
+			name:        "no validation: blank name saved",
+			user:        model.NewEmptyUser(),
+			repo:        &fakeRepo{},
+			wantID:      100,
+			wantInserts: 1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeRepo()
-			if tt.setup != nil {
-				tt.setup(f)
-			}
-			s := NewUserService(f)
-			got, err := s.SaveUser(context.Background(), tt.in)
-			if tt.wantErr != nil || tt.anyErr {
-				if err == nil || got != nil {
-					t.Fatalf("expected error, got %v %v", got, err)
+			svc := NewUserService(tt.repo)
+			got, err := svc.SaveUser(context.Background(), tt.user)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error")
 				}
-				if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
-					t.Fatalf("err %v not %v", err, tt.wantErr)
+				if tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs) {
+					t.Fatalf("err = %v, want wrapping %v", err, tt.wantErrIs)
 				}
-				if len(f.users) > 0 && tt.setup == nil {
-					t.Fatal("record persisted on error")
+				if errors.Is(err, ErrUserNotFound) {
+					t.Fatalf("save error must not be not-found")
 				}
-				return
+				if got != nil {
+					t.Fatalf("expected nil user on error")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tt.user {
+					t.Fatalf("expected the same entity returned")
+				}
+				if got.GetID() != tt.wantID {
+					t.Fatalf("id = %d, want %d", got.GetID(), tt.wantID)
+				}
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got.ID != tt.wantID {
-				t.Fatalf("id=%d want %d", got.ID, tt.wantID)
-			}
-			fetched, err := s.FetchUserByID(context.Background(), got.ID)
-			if err != nil || !fetched.Equal(got) {
-				t.Fatalf("fetch mismatch %v %v", fetched, err)
+			if tt.repo.insertCalls != tt.wantInserts || tt.repo.updateCalls != tt.wantUpdates {
+				t.Fatalf("inserts=%d updates=%d, want %d/%d", tt.repo.insertCalls, tt.repo.updateCalls, tt.wantInserts, tt.wantUpdates)
 			}
 		})
 	}
 }
 
 func TestFetchUserList(t *testing.T) {
+	dbErr := errors.New("db down")
+	users := []*model.User{
+		model.NewUserBuilder().ID(1).Name("a").Build(),
+		model.NewUserBuilder().ID(2).Name("b").Build(),
+	}
 	tests := []struct {
 		name    string
-		setup   func(*fakeRepo)
+		fn      func(context.Context) ([]*model.User, error)
 		wantLen int
 		wantErr bool
 	}{
-		{name: "users exist", setup: func(f *fakeRepo) { f.users[1] = user(1, "a"); f.users[2] = user(2, "b"); f.nextID = 3 }, wantLen: 2},
-		{name: "empty store", wantLen: 0},
-		{name: "repo returns nil slice", setup: func(f *fakeRepo) { f.nilAll = true }, wantLen: 0},
-		{name: "repo error", setup: func(f *fakeRepo) { f.err = errDB }, wantErr: true},
+		{"users present", func(context.Context) ([]*model.User, error) { return users, nil }, 2, false},
+		{"empty slice", func(context.Context) ([]*model.User, error) { return []*model.User{}, nil }, 0, false},
+		{"nil from repo becomes empty", func(context.Context) ([]*model.User, error) { return nil, nil }, 0, false},
+		{"repo error", func(context.Context) ([]*model.User, error) { return nil, dbErr }, 0, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeRepo()
-			if tt.setup != nil {
-				tt.setup(f)
-			}
-			got, err := NewUserService(f).FetchUserList(context.Background())
+			repo := &fakeRepo{findAllFn: tt.fn}
+			got, err := NewUserService(repo).FetchUserList(context.Background())
 			if tt.wantErr {
-				if !errors.Is(err, errDB) {
-					t.Fatalf("want errDB got %v", err)
+				if !errors.Is(err, dbErr) {
+					t.Fatalf("err = %v", err)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("unexpected: %v", err)
 			}
 			if got == nil {
-				t.Fatal("nil slice")
+				t.Fatalf("slice must not be nil")
 			}
 			if len(got) != tt.wantLen {
-				t.Fatalf("len=%d want %d", len(got), tt.wantLen)
+				t.Fatalf("len = %d want %d", len(got), tt.wantLen)
+			}
+			if repo.findAllCalls != 1 || repo.insertCalls+repo.updateCalls+repo.deleteCalls != 0 {
+				t.Fatalf("expected read-only single FindAll")
 			}
 		})
 	}
 }
 
 func TestFetchUserByID(t *testing.T) {
+	dbErr := errors.New("db down")
+	u := model.NewUserBuilder().ID(3).Name("hemraj").Build()
 	tests := []struct {
-		name     string
-		id       int32
-		repoErr  error
-		notFound bool
+		name         string
+		fn           func(context.Context, int32) (*model.User, bool, error)
+		wantUser     *model.User
+		wantNotFound bool
+		wantErrIs    error
 	}{
-		{name: "existing", id: 1},
-		{name: "missing", id: 99, notFound: true},
-		{name: "repo error", id: 1, repoErr: errDB},
+		{"found", func(context.Context, int32) (*model.User, bool, error) { return u, true, nil }, u, false, nil},
+		{"not found", func(context.Context, int32) (*model.User, bool, error) { return nil, false, nil }, nil, true, nil},
+		{"found flag but nil user", func(context.Context, int32) (*model.User, bool, error) { return nil, true, nil }, nil, true, nil},
+		{"repo error", func(context.Context, int32) (*model.User, bool, error) { return nil, false, dbErr }, nil, false, dbErr},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeRepo()
-			f.users[1] = user(1, "a")
-			f.err = tt.repoErr
-			got, err := NewUserService(f).FetchUserByID(context.Background(), tt.id)
+			repo := &fakeRepo{findByIDFn: tt.fn}
+			got, err := NewUserService(repo).FetchUserByID(context.Background(), 3)
+			if repo.lastFindID != 3 {
+				t.Fatalf("id passed = %d", repo.lastFindID)
+			}
 			switch {
-			case tt.notFound:
-				if got != nil || !errors.Is(err, ErrUserNotFound) {
-					t.Fatalf("want not found, got %v %v", got, err)
+			case tt.wantNotFound:
+				if !errors.Is(err, ErrUserNotFound) {
+					t.Fatalf("want not found, got %v", err)
 				}
-				var unf *UserNotFoundError
-				if !errors.As(err, &unf) {
-					t.Fatal("not UserNotFoundError")
+				var nf *UserNotFoundError
+				if !errors.As(err, &nf) {
+					t.Fatalf("want *UserNotFoundError")
 				}
 				if err.Error() != "User are not available" {
-					t.Fatalf("msg %q", err.Error())
+					t.Fatalf("msg = %q", err.Error())
 				}
-			case tt.repoErr != nil:
-				if got != nil || !errors.Is(err, tt.repoErr) || errors.Is(err, ErrUserNotFound) {
-					t.Fatalf("got %v %v", got, err)
+				if got != nil {
+					t.Fatalf("want nil user")
+				}
+			case tt.wantErrIs != nil:
+				if !errors.Is(err, tt.wantErrIs) || errors.Is(err, ErrUserNotFound) {
+					t.Fatalf("err = %v", err)
 				}
 			default:
-				if err != nil || got == nil || !got.Equal(user(1, "a")) {
-					t.Fatalf("got %v %v", got, err)
+				if err != nil || got != tt.wantUser {
+					t.Fatalf("got %v, %v", got, err)
 				}
 			}
 		})
@@ -246,147 +278,182 @@ func TestFetchUserByID(t *testing.T) {
 }
 
 func TestDeleteUser(t *testing.T) {
+	dbErr := errors.New("db down")
 	tests := []struct {
-		name    string
-		id      int32
-		repoErr error
-		wantErr error
+		name         string
+		fn           func(context.Context, int32) error
+		wantErr      bool
+		wantNoEntity bool
+		wantErrIs    error
 	}{
-		{name: "existing", id: 1},
-		{name: "missing", id: 42, wantErr: repository.ErrUserNotExist},
-		{name: "repo error", id: 1, repoErr: errDB, wantErr: errDB},
+		{"exists", nil, false, false, nil},
+		{"missing", func(context.Context, int32) error { return repository.ErrUserNotExist }, true, true, nil},
+		{"wrapped missing", func(context.Context, int32) error {
+			return errors.Join(errors.New("ctx"), repository.ErrUserNotExist)
+		}, true, true, nil},
+		{"db error", func(context.Context, int32) error { return dbErr }, true, false, dbErr},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeRepo()
-			f.users[1] = user(1, "a")
-			f.nextID = 2
-			f.err = tt.repoErr
-			s := NewUserService(f)
-			err := s.DeleteUser(context.Background(), tt.id)
-			if tt.wantErr != nil {
-				if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("got %v want %v", err, tt.wantErr)
-				}
-				if len(f.users) != 1 {
-					t.Fatal("records changed")
+			repo := &fakeRepo{deleteFn: tt.fn}
+			err := NewUserService(repo).DeleteUser(context.Background(), 9)
+			if repo.deleteCalls != 1 || repo.lastDeleteID != 9 {
+				t.Fatalf("delete calls=%d id=%d", repo.deleteCalls, repo.lastDeleteID)
+			}
+			if repo.findByIDCalls != 0 {
+				t.Fatalf("no service-level not-found check expected")
+			}
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected: %v", err)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatal(err)
+			if err == nil {
+				t.Fatalf("expected error")
 			}
-			if _, err := s.FetchUserByID(context.Background(), tt.id); !errors.Is(err, ErrUserNotFound) {
-				t.Fatalf("after delete want not found, got %v", err)
+			if errors.Is(err, ErrUserNotFound) {
+				t.Fatalf("delete must not produce not-found error")
+			}
+			if tt.wantNoEntity && !errors.Is(err, errNoEntity) {
+				t.Fatalf("want errNoEntity, got %v", err)
+			}
+			if tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs) {
+				t.Fatalf("want %v, got %v", tt.wantErrIs, err)
 			}
 		})
 	}
 }
 
 func TestUpdateUser(t *testing.T) {
+	dbErr := errors.New("db down")
 	tests := []struct {
-		name      string
-		id        int32
-		in        *model.User
-		repoErr   error
-		wantErr   bool
-		checkID   int32
-		checkName string
-		wantCount int
+		name        string
+		id          int
+		user        *model.User
+		repo        *fakeRepo
+		wantErr     bool
+		wantFinalID int32
+		wantInserts int
 	}{
-		{name: "existing id overrides arg id", id: 1, in: user(77, "updated"), checkID: 1, checkName: "updated", wantCount: 1},
-		{name: "missing id inserts new", id: 50, in: user(0, "fresh"), checkID: 2, checkName: "fresh", wantCount: 2},
-		{name: "repo error", id: 1, in: user(1, "x"), repoErr: errDB, wantErr: true, wantCount: 1},
-		{name: "nil user", id: 1, in: nil, wantErr: true, wantCount: 1},
+		{
+			name: "absent id forced", id: 4,
+			user: model.NewUserBuilder().Name("x").Build(),
+			repo: &fakeRepo{}, wantFinalID: 4,
+		},
+		{
+			name: "different id overridden", id: 4,
+			user: model.NewUserBuilder().ID(99).Name("x").Build(),
+			repo: &fakeRepo{}, wantFinalID: 4,
+		},
+		{
+			name: "null fields overwrite too", id: 4,
+			user: model.NewUser(1, sp("x"), nil, nil, nil, nil),
+			repo: &fakeRepo{updateFn: func(_ context.Context, u *model.User) error {
+				if u.GetEmail() != nil || u.GetAbout() != nil {
+					return errors.New("nil fields not passed through")
+				}
+				return nil
+			}},
+			wantFinalID: 4,
+		},
+		{
+			name: "missing record merges to insert, no not-found", id: 50,
+			user: model.NewUserBuilder().Name("y").Build(),
+			repo: &fakeRepo{updateFn: func(context.Context, *model.User) error { return repository.ErrUserNotExist }},
+			wantFinalID: 100, wantInserts: 1,
+		},
+		{
+			name: "db error", id: 4,
+			user:    model.NewUserBuilder().Name("z").Build(),
+			repo:    &fakeRepo{updateFn: func(context.Context, *model.User) error { return dbErr }},
+			wantErr: true,
+		},
+		{name: "nil user", id: 4, user: nil, repo: &fakeRepo{}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeRepo()
-			f.users[1] = user(1, "orig")
-			f.nextID = 2
-			s := NewUserService(f)
-			var origID int32
-			if tt.in != nil {
-				origID = tt.in.ID
-			}
-			f.err = tt.repoErr
-			err := s.UpdateUser(context.Background(), tt.id, tt.in)
-			if tt.in != nil && tt.in.ID != origID {
-				t.Fatal("caller input mutated")
-			}
-			if tt.in != nil && len(f.saves) > 0 && f.saves[0].ID != tt.id {
-				t.Fatalf("saved with id %d want %d", f.saves[0].ID, tt.id)
-			}
-			f.err = nil
-			if len(f.users) != tt.wantCount {
-				t.Fatalf("count=%d want %d", len(f.users), tt.wantCount)
-			}
+			got, err := NewUserService(tt.repo).UpdateUser(context.Background(), tt.id, tt.user)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatal("expected error")
+					t.Fatalf("expected error")
 				}
-				if tt.repoErr != nil && !errors.Is(err, tt.repoErr) {
-					t.Fatalf("got %v", err)
-				}
-				if *f.users[1].Name != "orig" {
-					t.Fatal("record modified on error")
+				if errors.Is(err, ErrUserNotFound) {
+					t.Fatalf("unexpected not-found")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("unexpected: %v", err)
 			}
-			got, err := s.FetchUserByID(context.Background(), tt.checkID)
-			if err != nil || *got.Name != tt.checkName {
-				t.Fatalf("got %v %v", got, err)
+			if got != tt.user {
+				t.Fatalf("expected mutated input returned")
+			}
+			if len(tt.repo.updatedIDs) != 1 || int(tt.repo.updatedIDs[0]) != tt.id {
+				t.Fatalf("update called with ids %v, want [%d]", tt.repo.updatedIDs, tt.id)
+			}
+			if got.GetID() != tt.wantFinalID {
+				t.Fatalf("final id = %d want %d", got.GetID(), tt.wantFinalID)
+			}
+			if tt.repo.insertCalls != tt.wantInserts {
+				t.Fatalf("inserts = %d", tt.repo.insertCalls)
 			}
 		})
 	}
 }
 
 func TestGetUserNameByName(t *testing.T) {
+	hemraj := model.NewUserBuilder().ID(3).Name("hemraj").Email("hemrajmalhi1234@gmail.com").
+		About("Sr").Role("java developer").Build()
 	tests := []struct {
-		name    string
-		query   string
-		setup   func(*fakeRepo)
-		wantNil bool
-		wantErr error
+		name      string
+		query     string
+		fn        func(context.Context, string) (*model.User, bool, error)
+		wantFound bool
+		wantErrIs error
 	}{
-		{name: "match", query: "alice"},
-		{name: "no match", query: "nobody", wantNil: true},
-		{name: "non unique", query: "alice", setup: func(f *fakeRepo) { f.users[3] = user(3, "alice") }, wantErr: repository.ErrNonUniqueResult},
-		{name: "repo error", query: "alice", setup: func(f *fakeRepo) { f.err = errDB }, wantErr: errDB},
+		{"found", "hemraj", func(context.Context, string) (*model.User, bool, error) { return hemraj, true, nil }, true, nil},
+		{"not found", "nobody", func(context.Context, string) (*model.User, bool, error) { return nil, false, nil }, false, nil},
+		{"found flag nil user", "x", func(context.Context, string) (*model.User, bool, error) { return nil, true, nil }, false, nil},
+		{"non unique", "dup", func(context.Context, string) (*model.User, bool, error) {
+			return nil, false, repository.ErrNonUniqueResult
+		}, false, repository.ErrNonUniqueResult},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeRepo()
-			f.users[1] = user(1, "alice")
-			f.users[2] = user(2, "bob")
-			f.nextID = 4
-			if tt.setup != nil {
-				tt.setup(f)
+			repo := &fakeRepo{findByNameFn: tt.fn}
+			got, found, err := NewUserService(repo).GetUserNameByName(context.Background(), tt.query)
+			if repo.lastName != tt.query || repo.findByNameCalls != 1 {
+				t.Fatalf("FindByName not called correctly")
 			}
-			before := len(f.users)
-			got, err := NewUserService(f).GetUserNameByName(context.Background(), tt.query)
-			if len(f.users) != before {
-				t.Fatal("state modified")
+			if repo.insertCalls+repo.updateCalls+repo.deleteCalls != 0 {
+				t.Fatalf("must be read-only")
 			}
-			if tt.wantErr != nil {
-				if got != nil || !errors.Is(err, tt.wantErr) {
-					t.Fatalf("got %v %v", got, err)
+			if tt.wantErrIs != nil {
+				if !errors.Is(err, tt.wantErrIs) || errors.Is(err, ErrUserNotFound) {
+					t.Fatalf("err = %v", err)
+				}
+				if got != nil || found {
+					t.Fatalf("expected no user on error")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("unexpected: %v", err)
 			}
-			if tt.wantNil {
+			if found != tt.wantFound {
+				t.Fatalf("found = %v", found)
+			}
+			if !tt.wantFound {
 				if got != nil {
-					t.Fatalf("want nil got %v", got)
+					t.Fatalf("expected nil user")
 				}
 				return
 			}
-			if got == nil || !got.Equal(user(1, "alice")) {
+			if got.GetName() == nil || *got.GetName() != tt.query {
+				t.Fatalf("returned name mismatch")
+			}
+			if !got.Equal(hemraj) {
 				t.Fatalf("got %v", got)
 			}
 		})
