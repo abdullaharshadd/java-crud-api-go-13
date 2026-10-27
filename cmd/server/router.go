@@ -38,6 +38,9 @@ func buildRouter() http.Handler {
 	if dsn == "" {
 		dsn = os.Getenv("DATABASE_URL")
 	}
+	if dsn == "" {
+		dsn = config.DefaultDSN
+	}
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
