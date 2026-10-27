@@ -16,7 +16,8 @@ var schemaStatements = []string{
 		"user_password VARCHAR(255) NULL, " +
 		"user_role VARCHAR(255) NULL, " +
 		"user_about VARCHAR(500) NULL, " +
-		"PRIMARY KEY (user_id)" +
+		"PRIMARY KEY (user_id), " +
+		"UNIQUE KEY uk_user_email (user_email)" +
 		") ENGINE=InnoDB",
 	"CREATE TABLE IF NOT EXISTS hibernate_sequence (next_val BIGINT NULL) ENGINE=InnoDB",
 	"INSERT INTO hibernate_sequence (next_val) SELECT 1 FROM DUAL " +
